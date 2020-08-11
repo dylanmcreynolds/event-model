@@ -7,7 +7,7 @@ matrix:
     - python: 3.7
       env: PUBLISH_DOCS=1
     - python: 3.7
-      env: JSONSCHEMA_2=1
+      env: JSONSCHEMA_3=1
     - python: 3.8
     - python: nightly
   allow_failures:
@@ -33,7 +33,7 @@ install:
   # In some builds, tests against older jsonschema.
   - |
     if [ $JSONSCHEMA_2 ]; then
-      pip install "jsonschema==2"
+      pip install "jsonschema==3"
     fi
 
 script:
