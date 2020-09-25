@@ -6,6 +6,7 @@ import json
 from enum import Enum
 from functools import partial
 import itertools
+import inspect
 import os
 from pkg_resources import resource_filename as rs_fn
 import threading
@@ -13,6 +14,7 @@ import time as ttime
 import types
 import uuid
 import warnings
+import weakref
 
 import jsonschema
 import numpy
@@ -54,7 +56,42 @@ class DocumentRouter:
     Finally, the call to ``router(name, doc)`` returns::
 
         (name, getattr(router, name)(doc))
+
+    Parameters
+    ----------
+    emit: callable, optional
+        Expected signature ``f(name, doc)``
     """
+    def __init__(self, *, emit=None):
+        # Put in some extra effort to validate `emit` carefully, because if
+        # this is used incorrectly the resultant errors can be confusing.
+        if emit is not None:
+            if not callable(emit):
+                raise ValueError("emit must be a callable")
+            sig = inspect.signature(emit)
+            try:
+                # Does this function accept two positional arguments?
+                sig.bind(None, None)
+            except TypeError:
+                raise ValueError("emit must accept two positional arguments, name and doc")
+            # Stash a weak reference to `emit`.
+            if inspect.ismethod(emit):
+                self._emit_ref = weakref.WeakMethod(emit)
+            else:
+                self._emit_ref = weakref.ref(emit)
+        else:
+            self._emit_ref = None
+
+    def emit(self, name, doc):
+        """
+        Emit to the callable provided an instantiation time, if any.
+        """
+        if self._emit_ref is not None:
+            # Call the weakref.
+            emit = self._emit_ref()
+            if emit is not None:
+                emit(name, doc)
+
     def __call__(self, name, doc, validate=False):
         """
         Process a document.
@@ -307,7 +344,7 @@ class HandlerRegistryView(collections.abc.Mapping):
             "The handler registry cannot be edited directly. "
             "Instead, use the method Filler.deregister_handler.")
 
-# A "coersion funcion" is a hook that Filler can use to, for example, ensure
+# A "coercion funcion" is a hook that Filler can use to, for example, ensure
 # all the external data read in my handlers is an *actual* numpy array as
 # opposed to some other array-like such as h5py.Dataset or dask.array.Array,
 # or wrap every result is dask.array.from_array(...).
@@ -319,8 +356,8 @@ class HandlerRegistryView(collections.abc.Mapping):
 # with the same API. See example below.
 #
 # The "state provided by the Filler", mentioned above is passed into the
-# coersion functions below as ``filler_state``. It is a namespace containing
-# information that may be useful for the coersion functions.  Currently, it has
+# coercion functions below as ``filler_state``. It is a namespace containing
+# information that may be useful for the coercion functions.  Currently, it has
 # ``filler_state.descriptor`` and ``filler_state.key``. More may be added in
 # the future if the need arises. Ultimately, this is necessary because Resource
 # documents don't know the shape and dtype of the data that they reference.
@@ -330,19 +367,19 @@ class HandlerRegistryView(collections.abc.Mapping):
 # As an implementation detail, the ``filler_state`` is a ``threading.local``
 # object to ensure that filling is thread-safe.
 #
-# Third-party libraries can register custom coersion options via the
-# register_coersion function below. For example, databroker uses this to
+# Third-party libraries can register custom coercion options via the
+# register_coercion function below. For example, databroker uses this to
 # register a 'delayed' option. This avoids introducing dependency on a specific
 # delayed-computation framework (e.g. dask) in event-model itself.
 
 
 def as_is(handler_class, filler_state):
-    "A no-op coersion function that returns handler_class unchanged."
+    "A no-op coercion function that returns handler_class unchanged."
     return handler_class
 
 
 def force_numpy(handler_class, filler_state):
-    "A coersion that makes handler_class.__call__ return actual numpy.ndarray."
+    "A coercion that makes handler_class.__call__ return actual numpy.ndarray."
     class Subclass(handler_class):
         def __call__(self, *args, **kwargs):
             raw_result = super().__call__(*args, **kwargs)
@@ -353,12 +390,12 @@ def force_numpy(handler_class, filler_state):
     return Subclass
 
 
-# maps coerce option to corresponding coersion function
-_coersion_registry = {'as_is': as_is,
+# maps coerce option to corresponding coercion function
+_coercion_registry = {'as_is': as_is,
                       'force_numpy': force_numpy}
 
 
-def register_coersion(name, func, overwrite=False):
+def register_coercion(name, func, overwrite=False):
     """
     Register a new option for :class:`Filler`'s ``coerce`` argument.
 
@@ -377,16 +414,19 @@ def register_coersion(name, func, overwrite=False):
         unless this is set to ``True``.
     """
 
-    if name in _coersion_registry and not overwrite:
+    if name in _coercion_registry and not overwrite:
         # If we are re-registering the same object, there is no problem.
-        original = _coersion_registry[name]
+        original = _coercion_registry[name]
         if original is func:
             return
         raise EventModelValueError(
-            f"The coersion function {func} could not be registered for the "
-            f"name {name} because {_coersion_registry[name]} is already "
+            f"The coercion function {func} could not be registered for the "
+            f"name {name} because {_coercion_registry[name]} is already "
             f"registered. Use overwrite=True to force it.")
-    _coersion_registry[name] = func
+    _coercion_registry[name] = func
+
+
+register_coersion = register_coercion  # back-compat for a spelling mistake
 
 
 class Filler(DocumentRouter):
@@ -504,15 +544,15 @@ class Filler(DocumentRouter):
                 "incompatible. At least one must be left as the default, "
                 "None.")
         try:
-            self._coersion_func = _coersion_registry[coerce]
+            self._coercion_func = _coercion_registry[coerce]
         except KeyError:
             raise EventModelKeyError(
                 f"The option coerce={coerce!r} was given to event_model.Filler. "
-                f"The valid options are {set(_coersion_registry)}.")
+                f"The valid options are {set(_coercion_registry)}.")
         self._coerce = coerce
 
         # See comments on coerision functions above for the use of
-        # _current_state, which is passed to coersion functions' `filler_state`
+        # _current_state, which is passed to coercion functions' `filler_state`
         # parameter.
         self._current_state = threading.local()
         self._unpatched_handler_registry = {}
@@ -566,7 +606,7 @@ class Filler(DocumentRouter):
     def __getstate__(self):
         return dict(
             inplace=self._inplace,
-            coersion_func=self._coerce,
+            coercion_func=self._coerce,
             handler_registry=self._unpatched_handler_registry,
             include=self.include,
             exclude=self.exclude,
@@ -579,10 +619,10 @@ class Filler(DocumentRouter):
 
     def __setstate__(self, d):
         self._inplace = d['inplace']
-        self._coerce = d['coersion_func']
+        self._coerce = d['coercion_func']
 
         # See comments on coerision functions above for the use of
-        # _current_state, which is passed to coersion functions' `filler_state`
+        # _current_state, which is passed to coercion functions' `filler_state`
         # parameter.
         self._current_state = threading.local()
         self._unpatched_handler_registry = {}
@@ -668,6 +708,23 @@ class Filler(DocumentRouter):
                       retry_intervals=retry_intervals)
 
     def register_handler(self, spec, handler, overwrite=False):
+        """
+        Register a handler.
+
+        Parameters
+        ----------
+        spec: str
+        handler: Handler
+        overwrite: boolean, optional
+            False by default
+
+        Raises
+        ------
+        DuplicateHandler
+            If a handler is already registered for spec and overwrite is False
+
+        See https://blueskyproject.io/event-model/external.html
+        """
         if (not overwrite) and (spec in self._handler_registry):
             original = self._unpatched_handler_registry[spec]
             if original is handler:
@@ -683,10 +740,26 @@ class Filler(DocumentRouter):
         self._unpatched_handler_registry[spec] = handler
         # Let the 'coerce' argument to Filler.__init__ modify the handler if it
         # wants to.
-        self._handler_registry[spec] = self._coersion_func(
+        self._handler_registry[spec] = self._coercion_func(
             handler, self._current_state)
 
     def deregister_handler(self, spec):
+        """
+        Deregister a handler.
+
+        If no handler is registered for this spec, it is no-op and returns
+        None.
+
+        Parameters
+        ----------
+        spec: str
+
+        Returns
+        -------
+        handler: Handler or None
+
+        See https://blueskyproject.io/event-model/external.html
+        """
         handler = self._handler_registry.pop(spec, None)
         if handler is not None:
             self._unpatched_handler_registry.pop(spec)
@@ -694,6 +767,7 @@ class Filler(DocumentRouter):
                 resource_uid, spec_ = key
                 if spec == spec_:
                     del self._handler_cache[key]
+        return handler
 
     def resource(self, doc):
         # Defer creating the handler instance until we actually need it, when
@@ -868,6 +942,8 @@ class Filler(DocumentRouter):
                     resource_uid,
                     f"Datum with id {datum_id} refers to unknown Resource "
                     f"uid {resource_uid}") from err
+            self._current_state.resource = resource
+            self._current_state.datum = datum_doc
             handler = self._get_handler_maybe_cached(resource)
             error_to_raise = DataNotAccessible(
                     f"Filler was unable to load the data referenced by "
@@ -885,6 +961,8 @@ class Filler(DocumentRouter):
             filled_doc['filled'][key] = datum_id
         self._current_state.key = None
         self._current_state.descriptor = None
+        self._current_state.resource = None
+        self._current_state.datum = None
         return filled_doc
 
     def descriptor(self, doc):
@@ -895,6 +973,12 @@ class Filler(DocumentRouter):
         return self
 
     def close(self):
+        """
+        Drop cached documents and handlers.
+
+        They are *not* explicitly cleared, so if there are other references to
+        these caches they will remain.
+        """
         # Drop references to the caches. If the user holds another reference to
         # them it's the user's problem to manage their lifecycle. If the user
         # does not (e.g. they are the default caches) the gc will look after
@@ -903,6 +987,28 @@ class Filler(DocumentRouter):
         self._handler_cache = None
         self._resource_cache = None
         self._datum_cache = None
+        self._descriptor_cache = None
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def clear_handler_cache(self):
+        """
+        Clear any cached handler instances.
+
+        This operation may free significant memory, depending on the
+        implementation of the handlers.
+        """
+        self._handler_cache.clear()
+
+    def clear_document_caches(self):
+        """
+        Clear any cached documents.
+        """
+        self._resource_cache.clear()
+        self._descriptor_cache.clear()
+        self._datum_cache.clear()
 
     def __exit__(self, *exc_details):
         self.close()
